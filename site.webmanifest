@@ -1,7 +1,7 @@
 {
   "name": "BarberGo Reservation",
-  "short_name": "Kasflow",
-  "description": "Aplikasi kasir dan manajemen barbershop dari BarberGo.",
+  "short_name": "BarberGo Reservation",
+  "description": "Aplikasi Barbergo. Book barbershop cabang kami",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
