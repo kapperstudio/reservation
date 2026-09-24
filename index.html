@@ -555,13 +555,14 @@ function closePanels(){closeModal()}
 document.addEventListener('click',e=>{qsa('.dd.open').forEach(d=>{if(!d.contains(e.target))d.classList.remove('open')})});
 
 /* ============================================================
-   ★ NOTIFIKASI PUSH (FCM + SUARA) — BLOK BARU
+   ★ NOTIFIKASI PUSH v2.3
+   Service Worker Manager + Background + Permission Manager
 ============================================================ */
 const VAPID_KEY='BKWQ_q8Xx81q7wRlcYZS02viVHgHUWuqZAIGJNtPBM7b3KUSQWRWHhPoNF-uc8OhOxsKdv2Rexxis51X3AD5Alg';
-let fcm=null,SW_REG=null;
+let fcm=null;
 try{fcm=firebase.messaging.isSupported()?firebase.messaging():null}catch(e){fcm=null}
 
-/* ---- Suara notifikasi (Web Audio "ting-ton", tanpa file mp3) ---- */
+/* ---------------- SUARA (Web Audio "ting-ton") ---------------- */
 const soundOn=()=>localStorage.getItem('rg_sound')!=='off';
 let audioCtx=null;
 function playNotifSound(){
@@ -570,7 +571,7 @@ function playNotifSound(){
   audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
   if(audioCtx.state==='suspended')audioCtx.resume();
   const t=audioCtx.currentTime;
-  [[880,0],[1244.5,.13]].forEach(([f,off])=>{ /* nada "ting-ton" */
+  [[880,0],[1244.5,.13]].forEach(([f,off])=>{
    const o=audioCtx.createOscillator(),g=audioCtx.createGain();
    o.type='sine';o.frequency.value=f;
    g.gain.setValueAtTime(.0001,t+off);
@@ -582,15 +583,77 @@ function playNotifSound(){
  }catch(e){}
 }
 
-/* ---- Registrasi Service Worker ---- */
+/* ============================================================
+   SERVICE WORKER MANAGER — register, ready, update, apply
+============================================================ */
+let SW_REG=null,SW_WAITING=null;
+
 async function registerSW(){
  if(!('serviceWorker' in navigator))return null;
  if(SW_REG)return SW_REG;
- try{SW_REG=await navigator.serviceWorker.register('/firebase-messaging-sw.js');return SW_REG}
- catch(e){console.warn('[FCM] SW gagal didaftarkan:',e);return null}
+ try{
+  SW_REG=await navigator.serviceWorker.register('/firebase-messaging-sw.js',{scope:'/'});
+  watchSWUpdates(SW_REG);
+  console.log('[SW] terdaftar, scope:',SW_REG.scope);
+  return SW_REG;
+ }catch(e){console.warn('[SW] register gagal:',e);return null}
 }
 
-/* ---- Simpan token ke Firestore (dibaca server/POS utk kirim notif) ---- */
+function swReady(){
+ return new Promise(res=>{
+  if(!('serviceWorker' in navigator))return res(null);
+  const t=setTimeout(()=>res(null),8000);
+  navigator.serviceWorker.ready.then(r=>{clearTimeout(t);res(r)}).catch(()=>{clearTimeout(t);res(null)});
+ });
+}
+
+function watchSWUpdates(reg){
+ reg.addEventListener('updatefound',()=>{
+  const nw=reg.installing;if(!nw)return;
+  nw.addEventListener('statechange',()=>{
+   if(nw.state==='installed'&&navigator.serviceWorker.controller){
+    SW_WAITING=nw;
+    push({icon:'refresh-cw',title:'Update tersedia 🔄',sub:'Muat ulang untuk memakai versi terbaru.',action:'Muat ulang',dur:10000,onClick:applySWUpdate});
+   }
+  });
+ });
+}
+function applySWUpdate(){
+ if(SW_WAITING)SW_WAITING.postMessage({type:'SKIP_WAITING'});
+ setTimeout(()=>location.reload(),300);
+}
+async function checkSWUpdate(){
+ const reg=SW_REG||await swReady();
+ if(!reg)return toast('Service Worker belum aktif.','alert-triangle',true);
+ try{await reg.update();toast('Service Worker diperiksa.','refresh-cw')}catch(e){toast('Gagal cek update.','alert-triangle',true)}
+}
+
+/* ============================================================
+   NOTIFICATION PERMISSION MANAGER — baca & pantau perubahan izin
+============================================================ */
+const PushPerm={
+ state:'default',
+ async read(){
+  if(!('Notification' in window)){this.state='unsupported';return this.state}
+  try{
+   const p=await navigator.permissions.query({name:'notifications'});
+   this.state=p.state;
+   p.onchange=()=>{this.state=p.state;onPermChange(p.state)};
+  }catch(e){this.state=Notification.permission} /* fallback browser lama */
+  return this.state;
+ }
+};
+function onPermChange(st){
+ try{
+  if(st==='granted'){getTokenAndSave();initFcmListeners();}
+  if(st==='denied'){
+   push({icon:'bell-off',title:'Notifikasi diblokir',sub:'Aktifkan lewat ikon gembok di address bar.',dur:6000});
+  }
+  if(typeof S!=='undefined'&&S.page==='settings')render();
+ }catch(e){}
+}
+
+/* ---------------- TOKEN FCM ---------------- */
 async function saveFcmToken(token){
  if(!token||!auth.currentUser)return;
  try{
@@ -605,18 +668,19 @@ async function saveFcmToken(token){
 
 async function getTokenAndSave(retry){
  retry=retry||0;
- if(!fcm||(('Notification' in window)&&Notification.permission!=='granted'))return;
+ if(!fcm)return;
+ if(('Notification' in window)&&Notification.permission!=='granted')return;
  try{
-  const reg=SW_REG||await registerSW();
+  const reg=SW_REG||await registerSW()||await swReady();
   const token=await fcm.getToken({vapidKey:VAPID_KEY,serviceWorkerRegistration:reg||undefined});
   if(token)await saveFcmToken(token);
  }catch(e){
-  if(retry<4)return setTimeout(()=>getTokenAndSave(retry+1),1500); /* tunggu SW aktif (kunjungan pertama) */
+  if(retry<4)return setTimeout(()=>getTokenAndSave(retry+1),1500); /* tunggu SW aktif */
   console.warn('[FCM] getToken gagal:',e);
  }
 }
 
-/* ---- Dedupe agar notif tidak dobel ---- */
+/* ---------------- DEDUPE ---------------- */
 const _nseen={};
 function notifFresh(key){
  const now=Date.now();
@@ -626,7 +690,7 @@ function notifFresh(key){
  return true;
 }
 
-/* ---- Pesan FCM saat app TERBUKA (foreground) ---- */
+/* ---------------- FOREGROUND (app terbuka) ---------------- */
 function initFcmListeners(){
  if(!fcm||fcm._rgListen)return;
  fcm._rgListen=true;
@@ -638,41 +702,84 @@ function initFcmListeners(){
   if(!notifFresh(key))return;
   playNotifSound();
   push({icon:d.icon||'bell-ring',title:n.title||d.title||'BarberGo',sub:n.body||d.body||'',dur:6000,
-   onClick:d.link?()=>{try{location.href=d.link}catch(e){}}:null});
+   onClick:()=>{if(d.link){try{location.href=d.link}catch(e){}}}});
  });
  try{fcm.onTokenRefresh(()=>getTokenAndSave())}catch(e){}
 }
 
-/* ---- Modal permintaan izin (UX lebih baik dari prompt browser langsung) ---- */
+/* ---------------- ROUTING klik notifikasi dari SW ---------------- */
+function handleNotifLink(link,type){
+ try{
+  if(type==='resv'){if(S.page!=='history')go('history');return}
+  if(link){location.href=link}
+ }catch(e){}
+}
+
+/* ============================================================
+   PERMISSION FLOW — modal izin, enable, disable, bantuan blocked
+============================================================ */
 function showPushAskModal(){
  openModal(`<h3>Aktifkan Notifikasi 🔔</h3>
- <p style="font-size:12.5px;color:var(--tx2);line-height:1.7;margin-top:6px">Dapatkan <b>notifikasi pesan chat</b> dari barbershop &amp; <b>update status reservasi</b> secara real-time — lengkap dengan suara.</p>
+ <p style="font-size:12.5px;color:var(--tx2);line-height:1.7;margin-top:6px">Dapatkan <b>notifikasi pesan chat</b> dari barbershop &amp; <b>update status reservasi</b> secara real-time — lengkap dengan suara, meski app sedang tertutup.</p>
  <div class="mrow"><button class="btn gho" onclick="closeModal()">Nanti Saja</button><button class="btn pri" onclick="enablePush()"><i data-lucide="bell-ring" style="width:14px;height:14px"></i> Aktifkan</button></div>`);
 }
 
 async function enablePush(){
  closeModal();
- if(!('Notification' in window))return toast('Browser tidak mendukung notifikasi.','alert-triangle',true);
+ if(!('Notification' in window))return toast('Browser tidak mendukung Notification API.','alert-triangle',true);
+ if(!('serviceWorker' in navigator))return toast('Browser tidak mendukung Service Worker.','alert-triangle',true);
  try{
+  await registerSW();
+  await swReady(); /* pastikan SW aktif SEBELUM getToken */
   const perm=await Notification.requestPermission();
-  if(perm!=='granted')return toast('Izin notifikasi tidak diberikan.','bell-off',true);
+  PushPerm.state=perm;
+  if(perm!=='granted'){
+   if(perm==='denied')showDeniedHelp();
+   else toast('Izin notifikasi belum diberikan.','bell-off',true);
+   if(S.page==='settings')render();
+   return;
+  }
   toast('Notifikasi diaktifkan!','bell-ring');
-  await registerSW();await getTokenAndSave();initFcmListeners();
+  playNotifSound();
+  await getTokenAndSave();
+  initFcmListeners();
   if(S.page==='settings')render();
  }catch(e){toast('Gagal mengaktifkan notifikasi: '+(e.message||e),'alert-triangle',true)}
 }
 
+function showDeniedHelp(){
+ openModal(`<h3>Notifikasi Diblokir 🔕</h3>
+ <p style="font-size:12.5px;color:var(--tx2);line-height:1.8;margin-top:8px">Kamu (atau browser) telah memblokir notifikasi untuk situs ini. Cara membukanya:</p>
+ <div style="font-size:12.5px;line-height:2;background:var(--hov);border-radius:10px;padding:12px 14px;margin-top:8px">
+  1️⃣ Klik ikon <b>🔒 gembok</b> di address bar<br>
+  2️⃣ Pilih <b>Site settings</b> / <b>Setelan situs</b><br>
+  3️⃣ Ubah <b>Notifications</b> → <b>Allow</b><br>
+  4️⃣ Muat ulang halaman (refresh)
+ </div>
+ <div class="mrow"><button class="btn gho" onclick="closeModal()">Tutup</button><button class="btn pri" onclick="closeModal();location.reload()"><i data-lucide="rotate-cw" style="width:14px;height:14px"></i> Muat Ulang</button></div>`);
+}
+
+async function disablePush(){
+ try{
+  await removeFcmToken();
+  toast('Push dimatikan di perangkat ini. Kamu bisa mengaktifkan lagi kapan saja.','bell-off');
+ }catch(e){toast('Gagal mematikan push.','alert-triangle',true)}
+ if(S.page==='settings')render();
+}
+
 async function initPushFlow(){
  if(!('Notification' in window)||!('serviceWorker' in navigator))return;
- if(Notification.permission==='granted'){
+ await PushPerm.read();
+ if(PushPerm.state==='granted'){
   await registerSW();await getTokenAndSave();initFcmListeners();
- }else if(Notification.permission==='default'&&!localStorage.getItem('rg_push_asked')){
-  localStorage.setItem('rg_push_asked','1');
-  setTimeout(showPushAskModal,2500); /* muncul setelah app siap */
+ }else if(PushPerm.state==='prompt'||PushPerm.state==='default'){
+  if(!localStorage.getItem('rg_push_asked')){
+   localStorage.setItem('rg_push_asked','1');
+   setTimeout(showPushAskModal,2500);
+  }
  }
 }
 
-/* ---- Hapus token saat logout ---- */
 async function removeFcmToken(){
  if(!fcm||!auth.currentUser)return;
  try{
@@ -686,19 +793,34 @@ async function removeFcmToken(){
  }catch(e){}
 }
 
-function testPush(){
+/* ---------------- TES ---------------- */
+function testPush(){ /* tes in-app + suara */
  playNotifSound();
- push({icon:'bell-ring',title:'Notifikasi Berjalan ✅',sub:'Pesan chat & update reservasi akan muncul di sini.',dur:5000});
+ push({icon:'bell-ring',title:'Notifikasi In-App ✅',sub:'Popup &amp; suara di dalam aplikasi berjalan.',dur:5000});
+}
+async function testSWNotification(){ /* tes notifikasi SISTEM via SW */
+ const reg=SW_REG||await swReady();
+ if(!reg)return toast('Service Worker belum aktif — muat ulang halaman.','alert-triangle',true);
+ try{
+  await reg.showNotification('BarberGo Tes Sistem 🔔',{
+   body:'Notifikasi Service Worker berjalan normal — ini tampil meski app diminimize.',
+   icon:'/favicon.png',badge:'/favicon.png',tag:'rg-test-'+Date.now(),renotify:true,
+   vibrate:[120,60,120],
+   data:{link:'/',type:'test'},
+   actions:[{action:'open',title:'Buka Aplikasi'},{action:'close',title:'Tutup'}]
+  });
+  toast('Notifikasi sistem terkirim! Cek tray/notification bar.','bell-ring');
+ }catch(e){toast('Gagal: '+(e.message||e),'alert-triangle',true)}
 }
 
 function toggleSound(){
  const on=soundOn();
  localStorage.setItem('rg_sound',on?'off':'on');
- if(!on)setTimeout(playNotifSound,80); /* preview bunyi saat dinyalakan */
+ if(!on)setTimeout(playNotifSound,80);
  render();
 }
 
-/* ---- Notif perubahan status reservasi (realtime) ---- */
+/* ---------------- NOTIF STATUS RESERVASI (realtime) ---------------- */
 let unsubResv=null,resvFirstSnap=true;
 const RESV_NOTIF={
  received:{icon:'check-circle-2',t:'Reservasi Dikonfirmasi ✅',s:'Toko telah menerima reservasimu.'},
@@ -710,7 +832,7 @@ function watchReservations(){
  resvFirstSnap=true;
  unsubResv=dbFS.collection('reservations').where('customerUid','==',auth.currentUser.uid)
  .onSnapshot(snap=>{
-  if(resvFirstSnap){resvFirstSnap=false;return} /* lewati load awal */
+  if(resvFirstSnap){resvFirstSnap=false;return}
   snap.docChanges().forEach(ch=>{
    if(ch.type==='removed')return;
    const r=ch.doc.data()||{},info=RESV_NOTIF[r.status];
@@ -1373,26 +1495,34 @@ function saveProfileEdit(){
 VIEWS.settings=()=>{
  const dark=document.body.classList.contains('dark');
  const snd=soundOn();
- const perm=('Notification' in window)?Notification.permission:'unsupported';
- const pBadge=perm==='granted'?'<span class="badge b-paid">AKTIF</span>':perm==='denied'?'<span class="badge b-can">DIBLOKIR</span>':'<span class="badge b-pend">BELUM AKTIF</span>';
+ const perm=PushPerm.state||'default';
+ let pBadge='',pActs='';
+ if(perm==='granted'){
+  pBadge='<span class="badge b-paid">AKTIF</span>';
+  pActs=`<button class="btn gho sm" onclick="testSWNotification()"><i data-lucide="bell-ring" style="width:13px;height:13px"></i> Tes</button>
+         <button class="btn gho sm" onclick="disablePush()"><i data-lucide="bell-off" style="width:13px;height:13px"></i> Matikan</button>`;
+ }else if(perm==='denied'){
+  pBadge='<span class="badge b-can">DIBLOKIR</span>';
+  pActs=`<button class="btn gho sm" onclick="showDeniedHelp()"><i data-lucide="lock" style="width:13px;height:13px"></i> Bantuan</button>`;
+ }else if(perm==='unsupported'){
+  pBadge='<span class="badge b-gray">TIDAK DIDUKUNG</span>';
+ }else{
+  pBadge='<span class="badge b-pend">BELUM AKTIF</span>';
+  pActs=`<button class="btn pri sm" onclick="enablePush()"><i data-lucide="bell" style="width:13px;height:13px"></i> Aktifkan</button>`;
+ }
  return `<div class="phead"><div class="ph-row">${backBtn()}<div><h1>Pengaturan</h1><p>Preferensi aplikasi reservasi.</p></div></div></div>
  <div class="card pad" style="max-width:520px">
-  <div class="hrow" style="cursor:default"><div class="in"><b>Notifikasi Push</b><small>Pesan chat &amp; update reservasi via Firebase Cloud Messaging</small></div>
-   ${pBadge}
-   ${perm==='granted'
-    ?`<button class="btn gho sm" onclick="testPush()"><i data-lucide="bell-ring" style="width:13px;height:13px"></i> Tes</button>`
-    :perm==='default'
-    ?`<button class="btn pri sm" onclick="enablePush()"><i data-lucide="bell" style="width:13px;height:13px"></i> Aktifkan</button>`
-    :''}</div>
+  <div class="hrow" style="cursor:default"><div class="in"><b>Notifikasi Push</b><small>Chat, reservasi &amp; background via FCM + Service Worker</small></div>${pBadge}${pActs}</div>
   <div class="hrow" style="cursor:default"><div class="in"><b>Suara Notifikasi</b><small>Bunyi “ting-ton” saat notifikasi masuk</small></div>
    <button class="btn ${snd?'pri':'gho'} sm" onclick="toggleSound()"><i data-lucide="${snd?'volume-2':'volume-x'}" style="width:13px;height:13px"></i> ${snd?'Nyala':'Mati'}</button></div>
   <div class="hrow" style="cursor:default"><div class="in"><b>Mode Gelap</b><small>Tampilan gelap nyaman di malam hari</small></div>
    <button class="btn ${dark?'pri':'gho'} sm" onclick="toggleDark()"><i data-lucide="${dark?'sun':'moon'}" style="width:13px;height:13px"></i> ${dark?'Terang':'Gelap'}</button></div>
-  <div class="hrow" style="cursor:default"><div class="in"><b>Versi Aplikasi</b><small>BarberGo Reservation v2.2</small></div><span class="badge b-gray">STABLE</span></div>
+  <div class="hrow" style="cursor:default"><div class="in"><b>Versi Aplikasi</b><small>BarberGo Reservation v2.3</small></div>
+   <button class="btn gho sm" onclick="checkSWUpdate()"><i data-lucide="refresh-cw" style="width:13px;height:13px"></i> Cek Update</button></div>
   <div class="hrow" style="cursor:default"><div class="in"><b>Logout</b><small>Keluar dari akun Google kamu</small></div><button class="btn dng sm" onclick="doLogout()"><i data-lucide="log-out" style="width:13px;height:13px"></i> Keluar</button></div>
  </div>`;
 };
-BIND.settings=()=>{};
+BIND.settings=()=>{PushPerm.read()};
 function openSettings(){go('settings')}
 function toggleDark(){
  document.body.classList.toggle('dark');
@@ -1402,12 +1532,18 @@ function toggleDark(){
 
 /* ================= BOOT (★ NOTIFIKASI: SW message + watchReservations + initPushFlow) ================= */
 if(localStorage.getItem('rg_theme')==='dark')document.body.classList.add('dark');
+
+/* ★ Service Worker: daftar awal + terima pesan klik notifikasi */
 if('serviceWorker' in navigator){
- try{navigator.serviceWorker.addEventListener('message',e=>{
-  const d=e.data||{};
-  if(d.type==='NOTIF_CLICK'&&d.link){try{location.href=d.link}catch(_){}}
- })}catch(e){}
+ try{
+  registerSW();
+  navigator.serviceWorker.addEventListener('message',e=>{
+   const d=e.data||{};
+   if(d.type==='NOTIF_CLICK')handleNotifLink(d.link,d.ntype);
+  });
+ }catch(e){}
 }
+
 auth.onAuthStateChanged(async u=>{
  if(u){
   const app=qs('#app'),lg=qs('#login');
@@ -1416,8 +1552,9 @@ auth.onAuthStateChanged(async u=>{
   await ensureProfile(u);
   renderNav();
   loadShops();
-  watchReservations();   /* ★ notif status reservasi realtime */
-  initPushFlow();        /* ★ FCM: izin + token + listener foreground */
+  watchReservations();   /* notif status reservasi */
+  PushPerm.read();       /* ★ baca & pantau permission */
+  initPushFlow();        /* ★ SW + token + listener */
  }else{
   const app=qs('#app'),lg=qs('#login');
   if(app)app.classList.add('hide');
